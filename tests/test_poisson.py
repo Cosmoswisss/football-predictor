@@ -222,3 +222,43 @@ def test_predict_match_probabilities_sum_to_one():
 def test_predict_match_unknown_team_raises():
     with pytest.raises(ValueError, match="Unknown team"):
         poisson.predict_match(toy_model(), "Nobody", "Weak")
+
+
+def test_recency_weights_halve_every_half_life():
+    dates = pd.Series(pd.to_datetime(["2024-01-31", "2024-01-01", "2023-12-02"]))
+
+    weights = poisson.recency_weights(dates, pd.Timestamp("2024-01-31"), half_life=30)
+
+    assert weights.tolist() == pytest.approx([1.0, 0.5, 0.25])
+
+
+def test_fit_poisson_half_life_must_be_positive():
+    with pytest.raises(ValueError, match="half_life"):
+        poisson.fit_poisson(small_dated_matches(), half_life=0)
+
+
+def test_fit_poisson_huge_half_life_matches_unweighted_fit():
+    matches, *_ = simulate_matches(n_seasons=2)
+
+    plain = poisson.fit_poisson(matches)
+    barely_weighted = poisson.fit_poisson(matches, half_life=1e9)
+
+    assert barely_weighted.home_advantage == pytest.approx(plain.home_advantage, abs=1e-6)
+    assert barely_weighted.attack == pytest.approx(plain.attack, abs=1e-6)
+
+
+def test_fit_poisson_short_half_life_follows_the_recent_strengths():
+    early, early_attack, *_ = simulate_matches(n_seasons=4, seed=1)
+    late, late_attack, *_ = simulate_matches(n_seasons=4, seed=2)
+    late["date"] += pd.Timedelta(days=400)  # the "late" strengths replace the early ones
+    matches = pd.concat([early, late], ignore_index=True)
+    teams = sorted(early_attack)
+
+    def distance(model, truth):
+        return np.mean([abs(model.attack[t] - truth[t]) for t in teams])
+
+    weighted = poisson.fit_poisson(matches, half_life=60)
+    unweighted = poisson.fit_poisson(matches)
+
+    assert distance(weighted, late_attack) < distance(weighted, early_attack)
+    assert distance(weighted, late_attack) < distance(unweighted, late_attack)

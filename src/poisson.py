@@ -63,17 +63,45 @@ def sum_to_zero_dummies(values: pd.Series, levels: list[str]) -> pd.DataFrame:
     return dummies
 
 
-def fit_poisson(matches: pd.DataFrame, as_of_date: pd.Timestamp | None = None) -> PoissonModel:
+def recency_weights(
+    dates: pd.Series, reference_date: pd.Timestamp, half_life: float
+) -> np.ndarray:
+    """Weight 0.5 ** (age / half_life): a match half_life days old counts half as much.
+
+    age is the number of days between the match and reference_date.
+    """
+    age_days = (pd.Timestamp(reference_date) - dates).dt.days.to_numpy().clip(min=0)
+    return 0.5 ** (age_days / half_life)
+
+
+def fit_poisson(
+    matches: pd.DataFrame,
+    as_of_date: pd.Timestamp | None = None,
+    half_life: float | None = None,
+) -> PoissonModel:
     """Fit the Poisson model on matches played strictly before as_of_date.
 
     The date filter lives here so a prediction can never use the match it is
     predicting or anything later (no data leakage). If as_of_date is None,
     all given matches are used. Raises ValueError if no match is left.
+
+    half_life (in days) makes recent matches count more: a match played
+    half_life days before as_of_date (or before the latest match if
+    as_of_date is None) gets half the weight of one played that day.
+    None means every match counts equally.
     """
+    if half_life is not None and half_life <= 0:
+        raise ValueError("half_life must be positive")
     if as_of_date is not None:
         matches = matches[matches["date"] < pd.Timestamp(as_of_date)]
     if matches.empty:
         raise ValueError("No matches available before as_of_date")
+
+    weights = None
+    if half_life is not None:
+        reference = as_of_date if as_of_date is not None else matches["date"].max()
+        match_weights = recency_weights(matches["date"], reference, half_life)
+        weights = np.concatenate([match_weights, match_weights])  # long format: home rows, then away rows
 
     long = to_long_format(matches)
     teams = sorted(set(long["team"]) | set(long["opponent"]))
@@ -84,8 +112,9 @@ def fit_poisson(matches: pd.DataFrame, as_of_date: pd.Timestamp | None = None) -
     exog.insert(0, "is_home", long["is_home"].astype(float))
     exog.insert(0, "intercept", 1.0)
 
-    # Maximum likelihood fit of: goals ~ Poisson(exp(exog @ params))
-    result = sm.GLM(long["goals"], exog, family=sm.families.Poisson()).fit()
+    # Maximum likelihood fit of: goals ~ Poisson(exp(exog @ params)).
+    # freq_weights multiplies each observation's log-likelihood by its weight.
+    result = sm.GLM(long["goals"], exog, family=sm.families.Poisson(), freq_weights=weights).fit()
     params = result.params
 
     def effects(prefix: str) -> dict[str, float]:
