@@ -1,21 +1,26 @@
 """Downloading and cleaning match data from football-data.co.uk."""
 
 import re
+import sys
 from difflib import SequenceMatcher
 from itertools import combinations
 from pathlib import Path
 
 import pandas as pd
 import requests
-import truststore
 
 BASE_URL = "https://www.football-data.co.uk/mmz4281"
-# Use the operating system's certificate store: Python's bundled certifi list
-# rejected the certificates on this machine (e.g. antivirus/proxy inspection).
-truststore.inject_into_ssl()
+# On Windows, use the operating system's certificate store: Python's bundled
+# certifi list rejected the certificates on this machine (e.g. antivirus/proxy
+# inspection). Other systems (Linux servers) work fine without it.
+if sys.platform == "win32":
+    import truststore
+
+    truststore.inject_into_ssl()
 
 RAW_DIR = Path("data/raw")
 PROCESSED_PATH = Path("data/processed/matches.csv")
+DEFAULT_START_YEARS = list(range(2015, 2026))  # 2015/16 .. 2025/26
 
 # Columns every season file must have, and odds columns that may be missing.
 REQUIRED_COLUMNS = ["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG", "FTR"]
@@ -172,3 +177,17 @@ def build_dataset(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     full.to_csv(out_path, index=False)
     return full
+
+
+def ensure_dataset(
+    start_years: list[int] = DEFAULT_START_YEARS, path: Path = PROCESSED_PATH
+) -> pd.DataFrame:
+    """Return the cleaned matches, building the file first if it does not exist.
+
+    Lets the app start on a fresh machine (e.g. a deployment, where the
+    git-ignored data folder is empty): it downloads and cleans the seasons once.
+    """
+    path = Path(path)
+    if path.exists():
+        return pd.read_csv(path, parse_dates=["date"])
+    return build_dataset(start_years, out_path=path)

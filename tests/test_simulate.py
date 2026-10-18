@@ -288,8 +288,9 @@ def test_season_functions_reject_unknown_season():
 def test_fit_before_season_ignores_that_season_and_later(monkeypatch):
     seen = {}
 
-    def fake_fit(matches, as_of_date):
+    def fake_fit(matches, as_of_date, **settings):
         seen["as_of"] = as_of_date
+        seen["settings"] = settings
         seen["max_date"] = matches[matches["date"] < as_of_date]["date"].max()
         return "model"
 
@@ -298,6 +299,7 @@ def test_fit_before_season_ignores_that_season_and_later(monkeypatch):
     assert simulate.fit_before_season(season_matches(), "2023/24") == "model"
     assert seen["as_of"] == pd.Timestamp("2023-08-01")
     assert seen["max_date"] == pd.Timestamp("2022-08-15")  # nothing from 2023/24 is usable
+    assert seen["settings"] == {"half_life": poisson.MODEL_HALF_LIFE, "ridge": poisson.MODEL_RIDGE}
 
 
 def test_actual_table_ranks_by_points_then_goal_difference():

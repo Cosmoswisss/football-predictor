@@ -5,7 +5,7 @@ from dataclasses import dataclass, replace
 import numpy as np
 import pandas as pd
 
-from src.poisson import PoissonModel, expected_goals, fit_poisson
+from src.poisson import MODEL_HALF_LIFE, MODEL_RIDGE, PoissonModel, expected_goals, fit_poisson
 
 
 def add_unseen_teams(
@@ -206,8 +206,15 @@ def season_fixtures(matches: pd.DataFrame, season: str) -> pd.DataFrame:
     return in_season[["home_team", "away_team"]].reset_index(drop=True)
 
 
-def fit_before_season(matches: pd.DataFrame, season: str) -> PoissonModel:
+def fit_before_season(
+    matches: pd.DataFrame,
+    season: str,
+    half_life: float | None = MODEL_HALF_LIFE,
+    ridge: float = MODEL_RIDGE,
+) -> PoissonModel:
     """Fit the Poisson model using only matches before the season's first match.
+
+    Uses the frozen half-life and ridge penalty of the current model unless told otherwise.
 
     This is what makes a season "replay" honest: the model knows nothing about
     the season it is asked to predict (no data leakage).
@@ -215,7 +222,9 @@ def fit_before_season(matches: pd.DataFrame, season: str) -> PoissonModel:
     in_season = matches[matches["season"] == season]
     if in_season.empty:
         raise ValueError(f"No matches for season {season!r}")
-    return fit_poisson(matches, as_of_date=in_season["date"].min())
+    return fit_poisson(
+        matches, as_of_date=in_season["date"].min(), half_life=half_life, ridge=ridge
+    )
 
 
 def actual_table(matches: pd.DataFrame, season: str) -> pd.DataFrame:

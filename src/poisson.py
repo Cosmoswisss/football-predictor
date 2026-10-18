@@ -1,11 +1,16 @@
 """Poisson model: fit team strengths and compute match outcome probabilities."""
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 from scipy.stats import poisson as poisson_dist
+
+# Model settings ("v2"), frozen after tuning on the validation seasons 2018/19-2020/21.
+MODEL_HALF_LIFE = 365  # days: a match this old counts half as much as one played today
+MODEL_RIDGE = 4.0  # penalty on attack/defence effects, a Normal prior with sd 1/sqrt(4) = 0.5
 
 
 def to_long_format(matches: pd.DataFrame) -> pd.DataFrame:
@@ -74,10 +79,88 @@ def recency_weights(
     return 0.5 ** (age_days / half_life)
 
 
+def fit_penalized_poisson(
+    X: np.ndarray,
+    y: np.ndarray,
+    weights: np.ndarray,
+    penalty: np.ndarray,
+    max_iter: int = 100,
+    tol: float = 1e-10,
+) -> np.ndarray:
+    """Maximize a ridge-penalized weighted Poisson log-likelihood.
+
+    Finds beta maximizing  sum_i w_i * (y_i*eta_i - exp(eta_i)) - 0.5 * sum_j penalty_j * beta_j**2
+    with eta = X @ beta. Column 0 of X must be the intercept. Newton's method
+    (the same thing as iteratively reweighted least squares): at each step solve
+    (X' W X + P) step = gradient, where W = diag(w * mu) and P = diag(penalty),
+    then halve the step until the objective does not get worse.
+    The penalty makes the objective strictly concave, so a finite maximum
+    exists even when an unpenalized fit would diverge.
+    """
+
+    def objective(beta: np.ndarray) -> float:
+        eta = X @ beta
+        return float(np.sum(weights * (y * eta - np.exp(eta))) - 0.5 * np.sum(penalty * beta**2))
+
+    beta = np.zeros(X.shape[1])
+    beta[0] = np.log(max(np.average(y, weights=weights), 1e-3))  # start at the overall scoring rate
+
+    for _ in range(max_iter):
+        mu = np.exp(X @ beta)
+        gradient = X.T @ (weights * (y - mu)) - penalty * beta
+        hessian = (X * (weights * mu)[:, None]).T @ X + np.diag(penalty)
+        step = np.linalg.solve(hessian, gradient)
+
+        current, scale = objective(beta), 1.0
+        while scale > 1e-8:
+            candidate = objective(beta + scale * step)
+            if np.isfinite(candidate) and candidate >= current - 1e-12:
+                break
+            scale /= 2
+        beta = beta + scale * step
+        if np.max(np.abs(scale * step)) < tol:
+            break
+    return beta
+
+
+def fit_ridge_poisson(
+    long: pd.DataFrame, teams: list[str], weights: np.ndarray | None, ridge: float
+) -> PoissonModel:
+    """Penalized fit on the long-format table; used by fit_poisson when ridge > 0.
+
+    One attack and one defence column per team (no sum-to-zero trick needed).
+    Only the attack and defence effects are penalized, not the intercept or
+    the home advantage. The effects come out summing to zero by themselves:
+    shifting all of them by c and the intercept by -c changes nothing in the
+    likelihood but increases the penalty, so the optimum is the centered one.
+    """
+    index = {team: i for i, team in enumerate(teams)}
+    n, n_teams = len(long), len(teams)
+    rows = np.arange(n)
+
+    X = np.zeros((n, 2 + 2 * n_teams))
+    X[:, 0] = 1.0  # intercept
+    X[:, 1] = long["is_home"].to_numpy()
+    X[rows, 2 + long["team"].map(index).to_numpy()] = 1.0  # attack of the scoring team
+    X[rows, 2 + n_teams + long["opponent"].map(index).to_numpy()] = 1.0  # defence of the opponent
+
+    penalty = np.concatenate([[0.0, 0.0], np.full(2 * n_teams, ridge)])
+    w = np.ones(n) if weights is None else weights
+    beta = fit_penalized_poisson(X, long["goals"].to_numpy(dtype=float), w, penalty)
+
+    return PoissonModel(
+        intercept=float(beta[0]),
+        home_advantage=float(beta[1]),
+        attack={team: float(beta[2 + i]) for team, i in index.items()},
+        defence={team: float(beta[2 + n_teams + i]) for team, i in index.items()},
+    )
+
+
 def fit_poisson(
     matches: pd.DataFrame,
     as_of_date: pd.Timestamp | None = None,
     half_life: float | None = None,
+    ridge: float = 0.0,
 ) -> PoissonModel:
     """Fit the Poisson model on matches played strictly before as_of_date.
 
@@ -89,9 +172,17 @@ def fit_poisson(
     half_life days before as_of_date (or before the latest match if
     as_of_date is None) gets half the weight of one played that day.
     None means every match counts equally.
+
+    ridge (>= 0) penalizes large attack/defence values: the fit maximizes the
+    weighted log-likelihood minus ridge/2 * sum(effects squared). This stops a
+    team with very little data (say 0 goals in 3 matches) from getting an
+    absurd strength. Equivalent to a Normal prior with standard deviation
+    1/sqrt(ridge) on every effect. 0 means no penalty (the plain maximum likelihood fit).
     """
     if half_life is not None and half_life <= 0:
         raise ValueError("half_life must be positive")
+    if ridge < 0:
+        raise ValueError("ridge must not be negative")
     if as_of_date is not None:
         matches = matches[matches["date"] < pd.Timestamp(as_of_date)]
     if matches.empty:
@@ -105,6 +196,9 @@ def fit_poisson(
 
     long = to_long_format(matches)
     teams = sorted(set(long["team"]) | set(long["opponent"]))
+
+    if ridge > 0:
+        return fit_ridge_poisson(long, teams, weights, ridge)
 
     attack_cols = sum_to_zero_dummies(long["team"], teams).add_prefix("attack_")
     defence_cols = sum_to_zero_dummies(long["opponent"], teams).add_prefix("defence_")
@@ -182,3 +276,71 @@ def predict_match(
     """
     lambda_home, lambda_away = expected_goals(model, home_team, away_team)
     return outcome_probabilities(score_matrix(lambda_home, lambda_away, max_goals))
+
+
+def month_starts(matches: pd.DataFrame) -> pd.DatetimeIndex:
+    """First day of every month from the first to the last match date."""
+    return pd.date_range(matches["date"].min(), matches["date"].max(), freq="MS")
+
+
+def strength_history(
+    matches: pd.DataFrame,
+    dates: pd.DatetimeIndex,
+    half_life: float | None = MODEL_HALF_LIFE,
+    min_matches: int = 100,
+    active_days: int = 400,
+    ridge: float = MODEL_RIDGE,
+) -> pd.DataFrame:
+    """Team strengths as the model saw them on each snapshot date.
+
+    For every date, the model is fitted only on matches strictly before it
+    (no leakage). Returns one row per date and team with columns date, team,
+    attack, defence and strength = attack - defence (higher is better; a
+    positive defence value means conceding more). The model uses the frozen
+    half-life and ridge penalty unless told otherwise.
+
+    Snapshots with fewer than min_matches earlier matches are skipped (the
+    fit would be too noisy). Only teams that played within the last
+    active_days days are reported, so relegated teams drop out of the chart.
+    """
+    rows = []
+    for date in dates:
+        earlier = matches[matches["date"] < date]
+        if len(earlier) < min_matches:
+            continue
+        model = fit_poisson(matches, as_of_date=date, half_life=half_life, ridge=ridge)
+
+        recent = earlier[earlier["date"] >= date - pd.Timedelta(days=active_days)]
+        active = set(recent["home_team"]) | set(recent["away_team"])
+        for team in sorted(active):
+            rows.append(
+                {
+                    "date": date,
+                    "team": team,
+                    "attack": model.attack[team],
+                    "defence": model.defence[team],
+                    "strength": model.attack[team] - model.defence[team],
+                }
+            )
+    return pd.DataFrame(rows, columns=["date", "team", "attack", "defence", "strength"])
+
+
+STRENGTH_PATH = Path("results/strength_history.csv")
+
+
+def save_strength_history(matches: pd.DataFrame, path: Path = STRENGTH_PATH) -> pd.DataFrame:
+    """Compute monthly team strengths for all matches and write them to a CSV.
+
+    Takes about 15 seconds (one model fit per month), so the dashboard reads
+    the saved file instead. Returns the table written.
+    """
+    history = strength_history(matches, month_starts(matches))
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    history.to_csv(path, index=False)
+    return history
+
+
+def load_strength_history(path: Path = STRENGTH_PATH) -> pd.DataFrame:
+    """Read a file written by save_strength_history."""
+    return pd.read_csv(path, parse_dates=["date"])

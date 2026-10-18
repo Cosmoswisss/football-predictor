@@ -250,3 +250,36 @@ def test_build_dataset_combines_sorts_and_saves(tmp_path, monkeypatch):
     saved = pd.read_csv(out_path, parse_dates=["date"])
     assert len(saved) == 2
     assert saved["date"].is_monotonic_increasing
+
+
+def test_ensure_dataset_reads_an_existing_file_without_building(tmp_path, monkeypatch):
+    path = tmp_path / "matches.csv"
+    pd.DataFrame({"date": ["2024-08-17"], "home_team": ["A"]}).to_csv(path, index=False)
+
+    def fail_build(*args, **kwargs):
+        raise AssertionError("must not build when the file exists")
+
+    monkeypatch.setattr(data, "build_dataset", fail_build)
+    df = data.ensure_dataset([2024], path=path)
+
+    assert df["date"].iloc[0] == pd.Timestamp("2024-08-17")
+
+
+def test_ensure_dataset_builds_when_the_file_is_missing(tmp_path, monkeypatch):
+    path = tmp_path / "processed" / "matches.csv"
+    built = {}
+
+    def fake_build(start_years, out_path):
+        built["args"] = (list(start_years), out_path)
+        return pd.DataFrame({"date": [pd.Timestamp("2024-08-17")]})
+
+    monkeypatch.setattr(data, "build_dataset", fake_build)
+    df = data.ensure_dataset([2023, 2024], path=path)
+
+    assert built["args"] == ([2023, 2024], path)
+    assert len(df) == 1
+
+
+def test_default_start_years_cover_2015_16_to_2025_26():
+    assert data.DEFAULT_START_YEARS[0] == 2015
+    assert data.DEFAULT_START_YEARS[-1] == 2025
