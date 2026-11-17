@@ -138,4 +138,4 @@ football-predictor/
 
 ## Data and credits
 
-Match results and bookmaker odds come from [football-data.co.uk](https://www.football-data.co.uk); the raw files are downloaded on demand and are not stored in this repository. Built with pandas, numpy, scipy, statsmodels, Streamlit and Plotly, as a learning project with Claude Code. Released under the licence in [LICENSE](LICENSE).
+Match results and bookmaker odds come from [football-data.co.uk](https://www.football-data.co.uk); the raw files are downloaded on demand and are not stored in this repository. Built with pandas, numpy, scipy, statsmodels, Streamlit and Plotly, as a learning project. Released under the licence in [LICENSE](LICENSE).
